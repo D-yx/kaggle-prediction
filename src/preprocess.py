@@ -100,7 +100,7 @@ def preprocess_ames_data(train_path='data/train.csv', test_path='data/test.csv')
 
     # 7. 处理数值特征的偏度 (Skewness)
     # 这对 Lasso/Ridge 等线性模型至关重要
-    numeric_feats = features.dtypes[features.dtypes != "object"].index
+    numeric_feats = features.select_dtypes(include=[np.number]).columns
     skewed_feats = features[numeric_feats].apply(lambda x: skew(x.dropna())).sort_values(ascending=False)
     skewness_df = pd.DataFrame({'Skew' :skewed_feats})
     

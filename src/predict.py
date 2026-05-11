@@ -16,7 +16,7 @@ warnings.filterwarnings('ignore')
 
 # 1. 调用预处理函数获取完全干净、处理好的 Numpy 矩阵和测试集ID
 print("步骤 1: 数据预处理...")
-X_train_df, y_train_series, X_test_df, test_id = preprocess_ames_data('train.csv', 'test.csv')
+X_train_df, y_train_series, X_test_df, test_id = preprocess_ames_data('data/train.csv', 'data/test.csv')
 
 # 将 DataFrame 转换为模型所需的 Numpy 数组
 X_train = np.array(X_train_df)
@@ -65,7 +65,7 @@ catboost = CatBoostRegressor(iterations=6000,
 
 # 模型4：正则化线性模型
 ridge = make_pipeline(RobustScaler(), RidgeCV(alphas=[14.5, 14.6, 14.7, 14.8, 14.9, 15, 15.1, 15.2, 15.3, 15.4, 15.5]))
-lasso = make_pipeline(RobustScaler(), LassoCV(max_iter=1e7, alphas=[0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006], random_state=42, cv=kfolds))
+lasso = make_pipeline(RobustScaler(), LassoCV(max_iter=int(1e7), alphas=[0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006], random_state=42, cv=kfolds))
 
 # 构建 Stacking 融合模型
 stack_gen = StackingCVRegressor(regressors=(xgboost, lightgbm, catboost, ridge, lasso),
