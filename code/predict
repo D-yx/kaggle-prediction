@@ -1,0 +1,90 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import KFold, cross_val_score
+from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import RobustScaler, LabelEncoder
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import RidgeCV, LassoCV, ElasticNetCV
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
+from mlxtend.regressor import StackingCVRegressor
+import warnings
+warnings.filterwarnings('ignore')
+
+# 1. 假设你已经读取了数据并进行了基础合并 (train + test)
+# train = pd.read_csv('train.csv')
+# test = pd.read_csv('test.csv')
+# 剔除极端的异常值 (例如 GrLivArea > 4000 且 SalePrice < 300000)
+# train = train.drop(train[(train['GrLivArea']>4000) & (train['SalePrice']<300000)].index)
+
+# 目标变量对数化
+# y_train = np.log1p(train['SalePrice'])
+
+# === 在这里进行你的特征工程 (填补缺失值、编码、创建 TotalSF 等) ===
+# 例如：features['TotalSF'] = features['TotalBsmtSF'] + features['1stFlrSF'] + features['2ndFlrSF']
+
+# 2. 定义高级机器学习模型
+# 参数通常需要通过 Optuna 或 GridSearchCV 提前调优
+kfolds = KFold(n_splits=10, shuffle=True, random_state=42)
+
+# 模型1：XGBoost (擅长处理稀疏数据，对防止过拟合有很好的正则化)
+xgboost = XGBRegressor(learning_rate=0.01, n_estimators=3460,
+                       max_depth=3, min_child_weight=0,
+                       gamma=0, subsample=0.7,
+                       colsample_bytree=0.7,
+                       objective='reg:squarederror', nthread=-1,
+                       scale_pos_weight=1, seed=27,
+                       reg_alpha=0.00006, random_state=42)
+
+# 模型2：LightGBM (速度极快，直方图算法，对类别特征友好)
+lightgbm = LGBMRegressor(objective='regression', 
+                         num_leaves=4,
+                         learning_rate=0.01, 
+                         n_estimators=5000,
+                         max_bin=200, 
+                         bagging_fraction=0.75,
+                         bagging_freq=5, 
+                         bagging_seed=7,
+                         feature_fraction=0.2,
+                         feature_fraction_seed=7,
+                         verbose=-1,
+                         random_state=42)
+
+# 模型3：CatBoost (无敌的类别特征处理能力，极少调参即可获得卓越表现)
+catboost = CatBoostRegressor(iterations=6000,
+                             learning_rate=0.005,
+                             depth=4,
+                             l2_leaf_reg=1,
+                             eval_metric='RMSE',
+                             random_seed=42,
+                             logging_level='Silent')
+
+# 模型4：加入一些正则化线性模型增加稳定性
+ridge = make_pipeline(RobustScaler(), RidgeCV(alphas=[14.5, 14.6, 14.7, 14.8, 14.9, 15, 15.1, 15.2, 15.3, 15.4, 15.5]))
+lasso = make_pipeline(RobustScaler(), LassoCV(max_iter=1e7, alphas=[0.0001, 0.0002, 0.0003, 0.0004, 0.0005, 0.0006], random_state=42, cv=kfolds))
+
+# 3. 构建 Stacking 融合模型 (元模型)
+# 使用 Ridge 作为元学习器，综合底层树模型和线性模型的优势
+stack_gen = StackingCVRegressor(regressors=(xgboost, lightgbm, catboost, ridge, lasso),
+                                meta_regressor=xgboost,
+                                use_features_in_secondary=True)
+
+# 4. 训练与预测
+print("开始训练模型组合...")
+# 注意：以下 X_train 和 y_train 需要替换为你处理好的特征矩阵和目标数组
+# stack_gen.fit(np.array(X_train), np.array(y_train))
+# xgboost.fit(X_train, y_train)
+# lightgbm.fit(X_train, y_train)
+# catboost.fit(X_train, y_train)
+
+# 最终预测结果（加权平均，你可以根据交叉验证的表现微调权重）
+# def blend_models_predict(X):
+#     return ((0.1 * ridge.predict(X)) + \
+#             (0.15 * lasso.predict(X)) + \
+#             (0.2 * xgboost.predict(X)) + \
+#             (0.15 * lightgbm.predict(X)) + \
+#             (0.1 * catboost.predict(X)) + \
+#             (0.3 * stack_gen.predict(np.array(X))))
+#
+# preds = np.expm1(blend_models_predict(X_test)) # 使用 expm1 还原真实房价

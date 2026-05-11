@@ -1,0 +1,124 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import skew
+from scipy.special import boxcox1p
+from sklearn.preprocessing import LabelEncoder
+
+def preprocess_ames_data(train_path='data/train.csv', test_path='data/test.csv'):
+    """
+    读取并执行Ames房价数据的全套预处理工作。
+    返回处理好的 X_train, y_train, 和 X_test
+    """
+    print("正在加载数据...")
+    train = pd.read_csv(train_path)
+    test = pd.read_csv(test_path)
+    
+    # 1. 异常值剔除 (Outliers)
+    # 根据原作者的建议，剔除面积极大但价格极低的离群点
+    train = train.drop(train[(train['GrLivArea']>4000) & (train['SalePrice']<300000)].index).reset_index(drop=True)
+
+    # 2. 提取目标变量并合并特征
+    # Kaggle 评分标准是基于对数误差的，因此这里使用 log1p 
+    y_train = np.log1p(train['SalePrice'])
+    
+    # 保存 Id 用于最后生成提交文件
+    test_id = test['Id']
+    
+    # 删除 Id 和目标变量，将 train 和 test 合并以便统一处理特征
+    train_features = train.drop(['Id', 'SalePrice'], axis=1)
+    test_features = test.drop(['Id'], axis=1)
+    features = pd.concat([train_features, test_features]).reset_index(drop=True)
+
+    print("正在处理缺失值...")
+    # 3. 填补缺失值 (NA)
+    # 类别1：NA代表"没有该设施" (根据数据字典)
+    none_cols = [
+        'PoolQC', 'MiscFeature', 'Alley', 'Fence', 'FireplaceQu', 
+        'GarageType', 'GarageFinish', 'GarageQual', 'GarageCond',
+        'BsmtQual', 'BsmtCond', 'BsmtExposure', 'BsmtFinType1', 'BsmtFinType2',
+        'MasVnrType'
+    ]
+    for col in none_cols:
+        features[col] = features[col].fillna('None')
+
+    # 类别2：NA代表 0 的数值特征 (没有车库/地下室，面积和数量自然是0)
+    zero_cols = [
+        'GarageYrBlt', 'GarageArea', 'GarageCars',
+        'BsmtFinSF1', 'BsmtFinSF2', 'BsmtUnfSF', 'TotalBsmtSF',
+        'BsmtFullBath', 'BsmtHalfBath', 'MasVnrArea'
+    ]
+    for col in zero_cols:
+        features[col] = features[col].fillna(0)
+
+    # 类别3：特殊填补 - 街道连接长度 (LotFrontage)
+    # 假设同一街区 (Neighborhood) 的房屋临街距离相近，使用该街区的均值填补
+    features['LotFrontage'] = features.groupby('Neighborhood')['LotFrontage'].transform(
+        lambda x: x.fillna(x.median())
+    )
+
+    # 类别4：使用众数填补 (基础特征少量缺失)
+    mode_cols = ['MSZoning', 'Electrical', 'KitchenQual', 'Exterior1st', 'Exterior2nd', 'SaleType', 'Functional']
+    for col in mode_cols:
+        features[col] = features[col].fillna(features[col].mode()[0])
+
+    # 类别5：无区分度特征剔除 (Utilities 几乎全部是 AllPub，只有一个 NoSeWa)
+    features = features.drop(['Utilities'], axis=1)
+
+    print("正在进行特征工程...")
+    # 4. 数据类型转换 (将数值型的类别特征转化为字符型)
+    features['MSSubClass'] = features['MSSubClass'].apply(str)
+    features['OverallCond'] = features['OverallCond'].apply(str)
+    features['YrSold'] = features['YrSold'].apply(str)
+    features['MoSold'] = features['MoSold'].apply(str)
+
+    # 5. 核心特征工程 (Feature Engineering)
+    # 房屋总面积 (地下室 + 一楼 + 二楼) - 对房价影响最大的单一特征
+    features['TotalSF'] = features['TotalBsmtSF'] + features['1stFlrSF'] + features['2ndFlrSF']
+    
+    # 房屋总卫浴数
+    features['TotalBath'] = features['FullBath'] + (0.5 * features['HalfBath']) + \
+                            features['BsmtFullBath'] + (0.5 * features['BsmtHalfBath'])
+    
+    # 布尔值特征：是否拥有地下室、二楼、壁炉等
+    features['HasBsmt'] = features['TotalBsmtSF'].apply(lambda x: 1 if x > 0 else 0)
+    features['Has2ndFloor'] = features['2ndFlrSF'].apply(lambda x: 1 if x > 0 else 0)
+    features['HasFireplace'] = features['Fireplaces'].apply(lambda x: 1 if x > 0 else 0)
+
+    # 6. 特征编码 (Label Encoding)
+    # 对于带有顺序性质的离散特征，使用 Label Encoder 保留其次序关系
+    cols_to_encode = [
+        'FireplaceQu', 'BsmtQual', 'BsmtCond', 'GarageQual', 'GarageCond', 
+        'ExterQual', 'ExterCond','HeatingQC', 'PoolQC', 'KitchenQual', 'BsmtFinType1', 
+        'BsmtFinType2', 'Functional', 'Fence', 'BsmtExposure', 'GarageFinish', 'LandSlope',
+        'LotShape', 'PavedDrive', 'Street', 'Alley', 'CentralAir', 'MSSubClass', 'OverallCond', 
+        'YrSold', 'MoSold'
+    ]
+    for col in cols_to_encode:
+        lbl = LabelEncoder()
+        lbl.fit(list(features[col].values))
+        features[col] = lbl.transform(list(features[col].values))
+
+    # 7. 处理数值特征的偏度 (Skewness)
+    # 这对 Lasso/Ridge 等线性模型至关重要
+    numeric_feats = features.dtypes[features.dtypes != "object"].index
+    skewed_feats = features[numeric_feats].apply(lambda x: skew(x.dropna())).sort_values(ascending=False)
+    skewness_df = pd.DataFrame({'Skew' :skewed_feats})
+    
+    # 筛选出偏度绝对值大于 0.75 的特征
+    skewed_features_to_fix = skewness_df[abs(skewness_df['Skew']) > 0.75].index
+    
+    # 使用 Box-Cox 转换使数据更接近正态分布
+    lam = 0.15
+    for feat in skewed_features_to_fix:
+        features[feat] = boxcox1p(features[feat], lam)
+
+    # 8. 独热编码 (One-Hot Encoding)
+    # 处理剩下的无序离散特征
+    features = pd.get_dummies(features)
+    print(f"数据预处理完成，特征总维度: {features.shape[1]}")
+
+    # 9. 分割回训练集和测试集
+    X_train = features.iloc[:len(y_train), :]
+    X_test = features.iloc[len(y_train):, :]
+
+    return X_train, y_train, X_test, test_id
