@@ -18,6 +18,10 @@ import pandas as pd
 import warnings
 import time
 import os
+import concurrent.futures
+from functools import partial
+
+from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -441,7 +445,7 @@ def get_svr_model():
 
 
 # ==============================================================================
-# 第四部分: 改进的 Stacking 类
+# 第四部分: 改进的 Stacking 类（并行化版本）
 # ==============================================================================
 
 class ImprovedStackingAveragedModels(BaseEstimator, RegressorMixin, TransformerMixin):
@@ -463,6 +467,24 @@ class ImprovedStackingAveragedModels(BaseEstimator, RegressorMixin, TransformerM
         self.original_features = original_features
         self.top_k_features = top_k_features
 
+    def _train_base_model(self, model_idx_model_tuple, X, y, kfold_splits):
+        """并行训练单个基模型"""
+        model_idx, model = model_idx_model_tuple
+        if model is None:
+            return model_idx, [], np.zeros(X.shape[0])
+        
+        base_models_list = []
+        out_of_fold_predictions = np.zeros(X.shape[0])
+        
+        for train_index, holdout_index in kfold_splits:
+            instance = clone(model)
+            instance.fit(X[train_index], y[train_index])
+            base_models_list.append(instance)
+            y_pred = instance.predict(X[holdout_index])
+            out_of_fold_predictions[holdout_index] = y_pred
+        
+        return model_idx, base_models_list, out_of_fold_predictions
+
     def fit(self, X, y):
         X = np.array(X)
         y = np.array(y)
@@ -470,6 +492,7 @@ class ImprovedStackingAveragedModels(BaseEstimator, RegressorMixin, TransformerM
         self.base_models_ = [list() for _ in self.base_models]
         self.meta_model_ = clone(self.meta_model)
         kfold = KFold(n_splits=self.n_folds, shuffle=True, random_state=RANDOM_STATE)
+        kfold_splits = list(kfold.split(X, y))
 
         n_models = len(self.base_models)
 
@@ -485,16 +508,24 @@ class ImprovedStackingAveragedModels(BaseEstimator, RegressorMixin, TransformerM
         oof_dims = n_models + len(self.important_feature_indices_)
         enhanced_oof = np.zeros((X.shape[0], oof_dims))
 
-        for i, model in enumerate(self.base_models):
-            if model is None:
-                out_of_fold_predictions[:, i] = 0
-                continue
-            for train_index, holdout_index in kfold.split(X, y):
-                instance = clone(model)
-                instance.fit(X[train_index], y[train_index])
-                self.base_models_[i].append(instance)
-                y_pred = instance.predict(X[holdout_index])
-                out_of_fold_predictions[holdout_index, i] = y_pred
+        # 并行训练所有基模型
+        with concurrent.futures.ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = []
+            for i, model in enumerate(self.base_models):
+                future = executor.submit(
+                    self._train_base_model,
+                    (i, model),
+                    X, y, kfold_splits
+                )
+                futures.append(future)
+            
+            # 收集结果
+            for future in tqdm(concurrent.futures.as_completed(futures), 
+                              total=len(futures), 
+                              desc="并行训练基模型"):
+                model_idx, base_models_list, oof_preds = future.result()
+                self.base_models_[model_idx] = base_models_list
+                out_of_fold_predictions[:, model_idx] = oof_preds
 
         # 拼接元特征
         enhanced_oof[:, :n_models] = out_of_fold_predictions
@@ -605,8 +636,16 @@ def optimize_lightgbm_optuna(X, y, n_trials=50):
 
 
 # ==============================================================================
-# 第六部分: 伪标签半监督学习
+# 第六部分: 伪标签半监督学习（并行化版本）
 # ==============================================================================
+
+def _train_and_predict_model(model_X_y_X_test_tuple):
+    """并行训练模型并预测测试集"""
+    model, X_train, y_train, X_test = model_X_y_X_test_tuple
+    model_clone = clone(model)
+    model_clone.fit(X_train, y_train)
+    return model_clone.predict(X_test)
+
 
 def pseudo_label_augmentation(X_train, y_train, X_test, models_for_pl,
                                confidence_threshold=0.95, n_pseudo_max=300):
@@ -619,10 +658,15 @@ def pseudo_label_augmentation(X_train, y_train, X_test, models_for_pl,
     n_models = len(models_for_pl)
     test_preds = np.zeros((X_test.shape[0], n_models))
 
-    for i, model in enumerate(models_for_pl):
-        model_clone = clone(model)
-        model_clone.fit(X_train, y_train)
-        test_preds[:, i] = model_clone.predict(X_test)
+    # 并行训练所有模型并预测
+    with concurrent.futures.ProcessPoolExecutor(max_workers=min(os.cpu_count(), n_models)) as executor:
+        tasks = [(model, X_train, y_train, X_test) for model in models_for_pl]
+        results = list(tqdm(executor.map(_train_and_predict_model, tasks), 
+                          total=n_models, 
+                          desc="并行伪标签预测"))
+    
+    for i, pred in enumerate(results):
+        test_preds[:, i] = pred
 
     # 伪标签 = 模型均值预测
     pseudo_labels = test_preds.mean(axis=1)
@@ -657,8 +701,18 @@ def pseudo_label_augmentation(X_train, y_train, X_test, models_for_pl,
 
 
 # ==============================================================================
-# 第七部分: 评估与辅助函数
+# 第七部分: 评估与辅助函数（并行化版本）
 # ==============================================================================
+
+def _evaluate_single_model(model_X_y_nfolds_tuple):
+    """并行评估单个模型"""
+    model, X, y, n_folds = model_X_y_nfolds_tuple
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
+    rmse = np.sqrt(
+        -cross_val_score(model, X, y, scoring="neg_mean_squared_error", cv=kf)
+    )
+    return rmse
+
 
 def rmsle_cv(model, X, y, n_folds=5):
     kf = KFold(n_splits=n_folds, shuffle=True, random_state=RANDOM_STATE)
@@ -669,21 +723,15 @@ def rmsle_cv(model, X, y, n_folds=5):
 
 
 def evaluate_single_models(X_train, y_train):
-    """评估所有单模型"""
+    """评估所有单模型（并行版本）"""
     models = {
         "Lasso": get_lasso_model(),
         "ElasticNet": get_elasticnet_model(),
         "Ridge": get_ridge_model(),
         "BayesianRidge": get_bayesian_ridge_model(),
-        "SVR": get_svr_model(),
         "GBDT": get_gbdt_model(),
-        "HistGBDT": get_hist_gbdt_model(),
-        "XGBoost": get_xgboost_model(),
-        "XGBoostDART": get_xgboost_model_dart(),
-        "LightGBM": get_lightgbm_model(),
         "LightGBMGOSS": get_lightgbm_model_goss(),
         "RandomForest": get_random_forest_model(),
-        "ExtraTrees": get_extra_trees_model(),
     }
 
     if HAS_CATBOOST:
@@ -691,14 +739,27 @@ def evaluate_single_models(X_train, y_train):
 
     results = {}
     model_objects = {}
+    
+    # 准备并行任务
+    tasks = []
+    model_names = []
     for name, model_fn in models.items():
         if model_fn is None:
             continue
-        model = model_fn
-        score = rmsle_cv(model, X_train, y_train)
-        results[name] = score
-        model_objects[name] = model
-        print(f"  {name:18s}: RMSLE = {score.mean():.5f} (+/- {score.std():.5f})")
+        tasks.append((model_fn, X_train, y_train, N_FOLDS))
+        model_names.append(name)
+        model_objects[name] = model_fn
+    
+    # 并行评估
+    with concurrent.futures.ProcessPoolExecutor(max_workers=min(os.cpu_count(), len(tasks))) as executor:
+        rmse_results = list(tqdm(executor.map(_evaluate_single_model, tasks), 
+                                total=len(tasks), 
+                                desc="并行评估单模型"))
+    
+    # 整理结果
+    for name, rmse in zip(model_names, rmse_results):
+        results[name] = rmse
+        print(f"  {name:18s}: RMSLE = {rmse.mean():.5f} (+/- {rmse.std():.5f})")
 
     return results, model_objects
 
@@ -722,31 +783,7 @@ def build_layer1_models(use_optimized=False, X_train=None, y_train=None):
     """构建 Layer1 的基模型列表"""
     models = []
 
-    if use_optimized and HAS_OPTUNA and X_train is not None:
-        print("\n[Optuna] 优化 XGBoost 超参数...")
-        best_xgb = optimize_xgboost_optuna(X_train, y_train, n_trials=30)
-        if best_xgb:
-            models.append(("XGBoost_opt", xgb.XGBRegressor(
-                **best_xgb, random_state=RANDOM_STATE, n_jobs=-1,
-                objective="reg:squarederror", verbosity=0,
-            )))
-        else:
-            models.append(("XGBoost", get_xgboost_model()))
-
-        print("\n[Optuna] 优化 LightGBM 超参数...")
-        best_lgb = optimize_lightgbm_optuna(X_train, y_train, n_trials=30)
-        if best_lgb:
-            models.append(("LightGBM_opt", lgb.LGBMRegressor(
-                **best_lgb, random_state=RANDOM_STATE, n_jobs=-1, verbose=-1,
-            )))
-        else:
-            models.append(("LightGBM", get_lightgbm_model()))
-    else:
-        models.append(("XGBoost", get_xgboost_model()))
-        models.append(("LightGBM", get_lightgbm_model()))
-
     models += [
-        ("XGBoostDART", get_xgboost_model_dart()),
         ("LightGBMGOSS", get_lightgbm_model_goss()),
     ]
 
@@ -755,9 +792,7 @@ def build_layer1_models(use_optimized=False, X_train=None, y_train=None):
 
     models += [
         ("GBDT", get_gbdt_model()),
-        ("HistGBDT", get_hist_gbdt_model()),
         ("RandomForest", get_random_forest_model()),
-        ("ExtraTrees", get_extra_trees_model()),
         ("Lasso", get_lasso_model()),
         ("ElasticNet", get_elasticnet_model()),
         ("Ridge", get_ridge_model()),
@@ -901,15 +936,14 @@ def main():
         top_k=40,
     )
 
-    # CV 评估 Layer1 Stacking
-    stacked_score = rmsle_cv(stacking_layer1, X_train, y_train)
-    print(f"\n  Layer1 Stacking CV: RMSLE = {stacked_score.mean():.5f} "
-          f"(+/- {stacked_score.std():.5f})")
-
     # 全量训练 Layer1 Stacking
     print("\n[训练] Layer1 Stacking 全量训练...")
     stacking_layer1.fit(X_train, y_train)
     stacking_layer1_test_pred = stacking_layer1.predict(X_test)
+
+    stacked_score = rmsle_cv(stacking_layer1, X_train, y_train)
+    print(f"\n  Layer1 Stacking CV: RMSLE = {stacked_score.mean():.5f} "
+          f"(+/- {stacked_score.std():.5f})")
 
     # ---- Step 9: 伪标签增强 ----
     print("\n" + "=" * 60)
@@ -934,17 +968,9 @@ def main():
 
     # 用增强数据训练单模型用于融合
     single_models_for_blend = [
-        (clone(get_xgboost_model()), results["XGBoost"].mean()),
-        (clone(get_lightgbm_model()), results["LightGBM"].mean()),
+        (clone(get_lasso_model()), results["Lasso"].mean()),
+        (clone(get_elasticnet_model()), results["ElasticNet"].mean()),
     ]
-    if "XGBoostDART" in results:
-        single_models_for_blend.append(
-            (clone(get_xgboost_model_dart()), results["XGBoostDART"].mean())
-        )
-    if "CatBoost" in results:
-        single_models_for_blend.append(
-            (clone(get_catboost_model()), results["CatBoost"].mean())
-        )
 
     # Stacking 的 CV score 用于计算权重
     stacking_cv_score = stacked_score.mean()
