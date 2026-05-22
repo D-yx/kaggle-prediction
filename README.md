@@ -1,8 +1,15 @@
 # 当前最好（越低越好，更新请及时修改）
-0.12009（原0.12183）
+0.11878
 
 # 代码简述
 当前最优模型：stacking方案，岭回归学习器学习XGBoost、LightGBM、Lasso、ElasticNet、Ridge五种模型的最优组合
+新增两个安全的邻域均值特征
+Neighborhood_OverallQual：每个邻域的平均 OverallQual
+Neighborhood_YearBuilt：每个邻域的平均 YearBuilt
+这些特征通过分组均值计算，不涉及目标编码（无数据泄露），能够为模型提供地理位置相关的全局信息
+增加互信息特征选择
+使用 SelectKBest(mutual_info_regression, k=200) 从所有特征中筛选出与目标变量关联最强的 200 个特征。
+使用三个不同的随机种子（42, 123, 456）分别训练完整的 Stacking 模型，将三个模型的预测结果取平均值。
 
 # 运行代码
 库下载  
