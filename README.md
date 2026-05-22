@@ -1,14 +1,18 @@
 # 当前最好（越低越好，更新请及时修改）
 
-0.12269->0.12183->0.11289
+##### 0.12269->0.12183->0.12157
 
 # 代码简述
 
 当前最优模型：stacking方案，岭回归学习器学习XGBoost、LightGBM、Lasso、ElasticNet、Ridge五种模型的最优组合
 
-Neighborhood 目标编码：用 5 折交叉验证将每个邻域的平均对数价格作为新特征加入，提升地理位置信息的表达能力。
+新增两个安全的邻域均值特征 ：Neighborhood\_OverallQual（每个邻域的 OverallQual 均值）Neighborhood\_YearBuilt（每个邻域的 YearBuilt 均值）
 
-Stacking 元模型升级：将元模型从线性 Ridge 替换为 XGBoost（非线性），使集成能学习基模型预测间的复杂交互。
+XGBoost/LightGBM 的树数量从 3000 减至 1500，reg\_alpha 从 0.005 增至 0.01，reg\_lambda 从 1.0 增至 1.5，并加入 early\_stopping\_rounds=50，
+
+在交叉验证 fold 内使用验证集早停，抑制过拟合
+
+减弱元模型正则化，额外加了一个基模型 get\_gbdt\_model()
 
 # 运行代码
 

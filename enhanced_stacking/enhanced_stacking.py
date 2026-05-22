@@ -1,7 +1,9 @@
 """
-Kaggle House Prices: 精简增强版（仅两处核心优化）
-1. Neighborhood 目标编码（5折交叉验证）
-2. Stacking 元模型改为 XGBoost（非线性）
+Kaggle House Prices: 稳健提升版
+- 新增少量有效交互特征（无目标编码）
+- 降低树模型迭代次数 + 早停
+- 元模型 Ridge(alpha=0.5)
+- 可选加入 CatBoost
 """
 
 import numpy as np
@@ -15,14 +17,14 @@ from scipy.special import boxcox1p
 from sklearn.model_selection import KFold, cross_val_score
 from sklearn.preprocessing import RobustScaler
 from sklearn.linear_model import Lasso, ElasticNet, Ridge
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.base import BaseEstimator, RegressorMixin, clone
 import xgboost as xgb
 import lightgbm as lgb
+from catboost import CatBoostRegressor
 
 # ==================== 数据加载与清洗 ====================
-
 def load_data(train_path="data/train.csv", test_path="data/test.csv"):
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
@@ -35,7 +37,6 @@ def load_data(train_path="data/train.csv", test_path="data/test.csv"):
 def remove_outliers(train):
     outlier_idx = train[(train["GrLivArea"] > 4000) & (train["SalePrice"] < 300000)].index
     train = train.drop(outlier_idx).reset_index(drop=True)
-    train = train[train["SalePrice"] > 30000].reset_index(drop=True)
     return train
 
 def target_transform(train):
@@ -44,15 +45,18 @@ def target_transform(train):
     return train, y_train
 
 def handle_missing_values(all_data):
+    # 车库相关
     for col in ["GarageType", "GarageFinish", "GarageQual", "GarageCond"]:
         all_data[col] = all_data[col].fillna("None")
     for col in ["GarageYrBlt", "GarageArea", "GarageCars"]:
         all_data[col] = all_data[col].fillna(0)
+    # 地下室相关
     for col in ["BsmtQual", "BsmtCond", "BsmtExposure", "BsmtFinType1", "BsmtFinType2"]:
         all_data[col] = all_data[col].fillna("None")
     for col in ["BsmtFinSF1", "BsmtFinSF2", "BsmtUnfSF", "TotalBsmtSF",
                 "BsmtFullBath", "BsmtHalfBath"]:
         all_data[col] = all_data[col].fillna(0)
+    # 其他
     for col in ["PoolQC", "MiscFeature", "Alley", "Fence", "FireplaceQu"]:
         all_data[col] = all_data[col].fillna("None")
     all_data["MasVnrType"] = all_data["MasVnrType"].fillna("None")
@@ -66,21 +70,33 @@ def handle_missing_values(all_data):
     return all_data
 
 def feature_engineering(all_data):
+    # 基础组合
     all_data["TotalSF"] = all_data["TotalBsmtSF"] + all_data["1stFlrSF"] + all_data["2ndFlrSF"]
     all_data["TotalPorchSF"] = (all_data["OpenPorchSF"] + all_data["EnclosedPorch"] +
                                 all_data["3SsnPorch"] + all_data["ScreenPorch"] + all_data["WoodDeckSF"])
     all_data["TotalBathrooms"] = (all_data["FullBath"] + 0.5 * all_data["HalfBath"] +
                                   all_data["BsmtFullBath"] + 0.5 * all_data["BsmtHalfBath"])
+    # 二值特征
     all_data["HasPool"] = (all_data["PoolArea"] > 0).astype(int)
     all_data["Has2ndFloor"] = (all_data["2ndFlrSF"] > 0).astype(int)
     all_data["HasGarage"] = (all_data["GarageArea"] > 0).astype(int)
     all_data["HasBsmt"] = (all_data["TotalBsmtSF"] > 0).astype(int)
     all_data["HasFireplace"] = (all_data["Fireplaces"] > 0).astype(int)
+    # 时间特征
     all_data["HouseAge"] = all_data["YrSold"] - all_data["YearBuilt"]
     all_data["RemodAge"] = all_data["YrSold"] - all_data["YearRemodAdd"]
     all_data["IsNewHouse"] = (all_data["YearBuilt"] == all_data["YrSold"]).astype(int)
+    # 质量×面积交互
     all_data["OverallQual_TotalSF"] = all_data["OverallQual"] * all_data["TotalSF"]
     all_data["OverallQual_GrLivArea"] = all_data["OverallQual"] * all_data["GrLivArea"]
+
+    # 新增有效特征（无目标泄漏，无类型错误）
+    all_data["Neighborhood_OverallQual"] = all_data.groupby("Neighborhood")["OverallQual"].transform("mean")
+    all_data["Neighborhood_OverallQual"] = all_data["Neighborhood_OverallQual"].fillna(all_data["OverallQual"].mean())
+
+    all_data["Neighborhood_YearBuilt"] = all_data.groupby("Neighborhood")["YearBuilt"].transform("mean")
+    all_data["Neighborhood_YearBuilt"] = all_data["Neighborhood_YearBuilt"].fillna(all_data["YearBuilt"].mean())
+
     return all_data
 
 def feature_transformation(all_data):
@@ -114,47 +130,36 @@ def feature_transformation(all_data):
     all_data = pd.get_dummies(all_data)
     return all_data
 
-# 核心优化1：Neighborhood 目标编码
-def add_neighborhood_target_encoding(all_data, y_train, ntrain):
-    print("   添加 Neighborhood 目标编码...")
-    y_temp = np.zeros(ntrain)
-    y_temp[:] = y_train
-    all_data['__y_temp__'] = np.nan
-    all_data.loc[:ntrain-1, '__y_temp__'] = y_temp
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    all_data['Neighborhood_enc'] = 0.0
-    for train_idx, val_idx in kf.split(np.arange(ntrain)):
-        fold_train = all_data.iloc[train_idx]
-        means = fold_train.groupby('Neighborhood')['__y_temp__'].mean()
-        val_indices = all_data.index[val_idx]
-        all_data.loc[val_indices, 'Neighborhood_enc'] = all_data.loc[val_indices, 'Neighborhood'].map(means).fillna(means.mean())
-    full_means = all_data.iloc[:ntrain].groupby('Neighborhood')['__y_temp__'].mean()
-    all_data.loc[ntrain:, 'Neighborhood_enc'] = all_data.loc[ntrain:, 'Neighborhood'].map(full_means).fillna(full_means.mean())
-    all_data.drop('__y_temp__', axis=1, inplace=True)
-    return all_data
-
-# ==================== 模型定义 ====================
-
+# ==================== 模型定义（减少树数量，保持早停） ====================
 def get_xgboost_model():
     return xgb.XGBRegressor(
-        n_estimators=3000, learning_rate=0.01, max_depth=4,
+        n_estimators=1500, learning_rate=0.01, max_depth=4,
         min_child_weight=3, gamma=0.0, subsample=0.7, colsample_bytree=0.7,
-        reg_alpha=0.005, reg_lambda=1.0, objective="reg:squarederror",
+        reg_alpha=0.01, reg_lambda=1.5, objective="reg:squarederror",
+        early_stopping_rounds=50, eval_metric='rmse',
         n_jobs=-1, random_state=42
     )
 
 def get_lightgbm_model():
     return lgb.LGBMRegressor(
-        n_estimators=3000, learning_rate=0.01, num_leaves=31,
+        n_estimators=1500, learning_rate=0.01, num_leaves=31,
         max_depth=-1, min_child_samples=20, subsample=0.7, colsample_bytree=0.7,
-        reg_alpha=0.005, reg_lambda=1.0, random_state=42, n_jobs=-1, verbose=-1
+        reg_alpha=0.01, reg_lambda=1.5, random_state=42, n_jobs=-1, verbose=-1,
+        early_stopping_rounds=50
     )
 
 def get_gbdt_model():
     return GradientBoostingRegressor(
-        n_estimators=3000, learning_rate=0.01, max_depth=4,
+        n_estimators=1500, learning_rate=0.01, max_depth=4,
         max_features="sqrt", min_samples_leaf=15, min_samples_split=10,
         loss="huber", random_state=42
+    )
+
+def get_catboost_model():
+    return CatBoostRegressor(
+        iterations=1000, learning_rate=0.01, depth=4,
+        l2_leaf_reg=3, eval_metric='RMSE', early_stopping_rounds=50,
+        random_seed=42, logging_level='Silent'
     )
 
 def get_lasso_model():
@@ -166,8 +171,7 @@ def get_elasticnet_model():
 def get_ridge_model():
     return make_pipeline(RobustScaler(), Ridge(alpha=10.0))
 
-# ==================== Stacking 集成器（元模型 XGBoost） ====================
-
+# ==================== Stacking 集成器（支持早停） ====================
 class StackingAveragedModels(BaseEstimator, RegressorMixin):
     def __init__(self, base_models, meta_model, n_folds=5):
         self.base_models = base_models
@@ -183,10 +187,21 @@ class StackingAveragedModels(BaseEstimator, RegressorMixin):
         out_of_fold_predictions = np.zeros((X.shape[0], len(self.base_models)))
         for i, model in enumerate(self.base_models):
             for train_index, holdout_index in kfold.split(X, y):
+                X_train_fold, X_val_fold = X[train_index], X[holdout_index]
+                y_train_fold, y_val_fold = y[train_index], y[holdout_index]
                 instance = clone(model)
-                instance.fit(X[train_index], y[train_index])
+                if hasattr(instance, 'early_stopping_rounds'):
+                    try:
+                        instance.fit(
+                            X_train_fold, y_train_fold,
+                            eval_set=[(X_val_fold, y_val_fold)]
+                        )
+                    except Exception:
+                        instance.fit(X_train_fold, y_train_fold)
+                else:
+                    instance.fit(X_train_fold, y_train_fold)
                 self.base_models_[i].append(instance)
-                y_pred = instance.predict(X[holdout_index])
+                y_pred = instance.predict(X_val_fold)
                 out_of_fold_predictions[holdout_index, i] = y_pred
         self.meta_model_.fit(out_of_fold_predictions, y)
         return self
@@ -200,11 +215,16 @@ class StackingAveragedModels(BaseEstimator, RegressorMixin):
 
 def build_stacking_model():
     base_models = [
-        get_xgboost_model(), get_lightgbm_model(), get_gbdt_model(),
-        get_lasso_model(), get_elasticnet_model(), get_ridge_model()
+        get_xgboost_model(),
+        get_lightgbm_model(),
+        get_gbdt_model(),
+        get_catboost_model(),   # 可选，确保已安装 catboost
+        get_lasso_model(),
+        get_elasticnet_model(),
+        get_ridge_model(),
     ]
-    # 核心优化2：元模型改为 XGBoost
-    meta_model = xgb.XGBRegressor(n_estimators=200, max_depth=3, learning_rate=0.05, random_state=42)
+    # 元模型 Ridge 正则化更弱
+    meta_model = Ridge(alpha=0.5)
     return StackingAveragedModels(base_models=base_models, meta_model=meta_model, n_folds=5)
 
 def rmsle_cv(model, X, y, n_folds=5):
@@ -213,7 +233,6 @@ def rmsle_cv(model, X, y, n_folds=5):
     return rmse
 
 # ==================== 主流程 ====================
-
 def main():
     print("=" * 60)
     print("加载数据...")
@@ -227,11 +246,10 @@ def main():
     ntrain = train.shape[0]
     print(f"移除离群值后训练集: {train.shape}")
 
-    print("\n特征工程（包含目标编码）...")
+    print("\n特征工程...")
     all_data = pd.concat([train, test], axis=0, ignore_index=True)
     all_data = handle_missing_values(all_data)
     all_data = feature_engineering(all_data)
-    all_data = add_neighborhood_target_encoding(all_data, y_train, ntrain)
     all_data = feature_transformation(all_data)
 
     X_train = all_data[:ntrain].values.astype(np.float64)
@@ -246,7 +264,7 @@ def main():
     X_test = X_test[:, keep]
     print(f"特征总数: {X_train.shape[1]}")
 
-    print("\n训练 Stacking 模型（元模型=XGBoost）...")
+    print("\n训练 Stacking 模型（元模型=Ridge, alpha=0.5, 带早停）...")
     stacking = build_stacking_model()
     stacking_score = rmsle_cv(stacking, X_train, y_train)
     print(f"5折交叉验证 RMSLE: {stacking_score.mean():.5f} (+/- {stacking_score.std():.5f})")
@@ -254,12 +272,12 @@ def main():
     print("全量训练并预测测试集...")
     stacking.fit(X_train, y_train)
     final_pred = stacking.predict(X_test)
-    final_pred = np.clip(final_pred, 9.0, 14.0)  # log1p 裁剪
+    final_pred = np.clip(final_pred, 9.0, 14.0)
 
     submission = pd.DataFrame({"Id": test_id, "SalePrice": np.expm1(final_pred)})
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    output_path = os.path.join(script_dir, "submission_enhanced.csv")
-    submission.to_csv(output_path, index=False,float_format="%.6f")
+    output_path = os.path.join(script_dir, "submission_boost.csv")
+    submission.to_csv(output_path, index=False, float_format="%.6f")
     print(f"\n提交文件已保存: {output_path}")
     print(f"预测价格范围: ${submission['SalePrice'].min():,.0f} ~ ${submission['SalePrice'].max():,.0f}")
     print(f"预测价格均值: ${submission['SalePrice'].mean():,.0f}")
