@@ -1,1 +1,8 @@
 .venv/
+.idea/
+__pycache__/
+*.py[cod]
+catboost_info/
+selected_features.csv
+features_dropped_by_threshold_*.csv
+local_cv_oof.csv
